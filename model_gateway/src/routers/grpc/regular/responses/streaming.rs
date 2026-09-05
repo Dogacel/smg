@@ -184,7 +184,7 @@ async fn process_and_transform_sse_stream(
     // open items, attach the error and the partial output — never fall through
     // to response.completed. Captured here, handled after the loop where the
     // accumulator can be consumed.
-    let mut failure: Option<(String, String)> = None;
+    let mut failure: Option<(StreamFailureReason, String, String)> = None;
 
     // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
@@ -192,6 +192,7 @@ async fn process_and_transform_sse_stream(
             Ok(chunk) => chunk,
             Err(e) => {
                 failure = Some((
+                    StreamFailureReason::ReadError,
                     "stream_read_error".to_string(),
                     format!("Stream read error: {e}"),
                 ));
@@ -225,8 +226,8 @@ async fn process_and_transform_sse_stream(
                     // The chat layer reports a mid-stream backend failure as an
                     // error frame; relaying it and then completing would tell
                     // the client the response succeeded. Fail terminally.
-                    if let Some(frame_error) = parse_error_frame(json_str) {
-                        failure = Some(frame_error);
+                    if let Some((code, message)) = parse_error_frame(json_str) {
+                        failure = Some((StreamFailureReason::BackendError, code, message));
                         break;
                     }
                     // Not a valid chat chunk - might be error event, pass through
@@ -245,22 +246,15 @@ async fn process_and_transform_sse_stream(
 
     let usage_json = build_usage_json(accumulator.usage.as_ref());
 
-    if let Some((code, message)) = failure {
+    if let Some((reason, code, message)) = failure {
         // Terminal failure: response.failed carries the typed error and the
-        // partial output, and what gets persisted is exactly what the client
-        // was shown — a failed response with its partials, not a completed one.
-        Metrics::record_responses_stream_failure(
-            &original_request.model,
-            if code == "stream_read_error" {
-                "read_error"
-            } else {
-                "backend_error"
-            },
-        );
-        event_emitter
-            .emit_failed(&code, &message, usage_json.as_ref(), &tx)
+        // partial output, and what gets persisted is the very response the
+        // client was shown — a failed response with its partials, not a
+        // completed one.
+        Metrics::record_responses_stream_failure(&original_request.model, reason.label());
+        let failed_response = event_emitter
+            .emit_failed(&code, &message, accumulator.usage.clone(), &tx)
             .await;
-        let failed_response = accumulator.finalize_failed(&code, &message);
         persist_response_if_needed(
             conversation_storage,
             conversation_item_storage,
@@ -403,26 +397,7 @@ impl StreamingResponseAccumulator {
     }
 
     fn finalize(self) -> ResponsesResponse {
-        self.finalize_with_item_status("completed", None)
-    }
-
-    /// Finalize after a mid-stream failure: partial content survives with
-    /// `"incomplete"` item status, the response status is `failed`, and the
-    /// typed error rides the response — matching the terminal
-    /// `response.failed` event the client was shown.
-    fn finalize_failed(mut self, code: &str, message: &str) -> ResponsesResponse {
-        self.finish_reason = Some("failed".to_string());
-        self.finalize_with_item_status(
-            "incomplete",
-            Some(json!({"code": code, "message": message})),
-        )
-    }
-
-    fn finalize_with_item_status(
-        self,
-        item_status: &str,
-        error: Option<Value>,
-    ) -> ResponsesResponse {
+        let item_status = "completed";
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
         // Add message content if present
@@ -478,17 +453,13 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
-        let mut response = ResponsesResponse::builder(&self.response_id, &self.model)
+        ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)
             .created_at(self.created_at)
             .status(status)
             .output(output)
             .maybe_usage(usage)
-            .build();
-        if error.is_some() {
-            response.error = error;
-        }
-        response
+            .build()
     }
 }
 
@@ -706,13 +677,17 @@ async fn execute_tool_loop_streaming_internal(
         let accumulated_response =
             match convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await? {
                 StreamOutcome::Complete(response) => response,
-                StreamOutcome::Failed(code, message) => {
+                StreamOutcome::Failed {
+                    reason,
+                    code,
+                    message,
+                } => {
                     // Terminal failure: close open items and attach the error
                     // plus whatever output (mcp_list_tools, prior tool calls,
                     // partial text) had accumulated across iterations.
                     Metrics::record_responses_stream_failure(
                         &current_request.model,
-                        "backend_error",
+                        reason.label(),
                     );
                     emitter.emit_failed(&code, &message, None, &tx).await;
                     return Ok(());
@@ -1059,11 +1034,35 @@ async fn execute_tool_loop_streaming_internal(
     Ok(())
 }
 
+/// Why a chat stream terminated early — the closed label set of the
+/// `smg_responses_stream_failures_total{reason}` counter. Decided where the
+/// failure is observed, never recovered from an upstream-controlled code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamFailureReason {
+    /// The response body could not be read (transport/read error).
+    ReadError,
+    /// The chat layer delivered an error frame mid-stream.
+    BackendError,
+}
+
+impl StreamFailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            StreamFailureReason::ReadError => "read_error",
+            StreamFailureReason::BackendError => "backend_error",
+        }
+    }
+}
+
 /// Outcome of draining one chat stream iteration.
 enum StreamOutcome {
     Complete(ChatCompletionResponse),
-    /// The chat layer failed mid-stream: `(code, message)`.
-    Failed(String, String),
+    /// The chat layer failed mid-stream.
+    Failed {
+        reason: StreamFailureReason,
+        code: String,
+        message: String,
+    },
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
@@ -1079,10 +1078,11 @@ async fn convert_and_accumulate_stream(
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(e) => {
-                return Ok(StreamOutcome::Failed(
-                    "stream_read_error".to_string(),
-                    format!("Stream read error: {e}"),
-                ));
+                return Ok(StreamOutcome::Failed {
+                    reason: StreamFailureReason::ReadError,
+                    code: "stream_read_error".to_string(),
+                    message: format!("Stream read error: {e}"),
+                });
             }
         };
 
@@ -1109,7 +1109,11 @@ async fn convert_and_accumulate_stream(
                     // Dropping it silently would let the loop fall through to
                     // response.completed over truncated output.
                     if let Some((code, message)) = parse_error_frame(json_str) {
-                        return Ok(StreamOutcome::Failed(code, message));
+                        return Ok(StreamOutcome::Failed {
+                            reason: StreamFailureReason::BackendError,
+                            code,
+                            message,
+                        });
                     }
                 }
             }
@@ -1313,21 +1317,8 @@ mod tests {
     }
 
     #[test]
-    fn finalize_failed_preserves_partials_as_incomplete() {
-        let request = ResponsesRequest::default();
-        let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.content_buffer.push_str("partial answer");
-
-        let response = accumulator.finalize_failed("stream_error", "worker died");
-
-        assert!(matches!(response.status, ResponseStatus::Failed));
-        let wire = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(wire.pointer("/status"), Some(&json!("failed")));
-        assert_eq!(wire.pointer("/error/code"), Some(&json!("stream_error")));
-        assert_eq!(wire.pointer("/output/0/status"), Some(&json!("incomplete")));
-        assert_eq!(
-            wire.pointer("/output/0/content/0/text"),
-            Some(&json!("partial answer"))
-        );
+    fn failure_reason_labels_are_the_closed_metric_set() {
+        assert_eq!(StreamFailureReason::ReadError.label(), "read_error");
+        assert_eq!(StreamFailureReason::BackendError.label(), "backend_error");
     }
 }

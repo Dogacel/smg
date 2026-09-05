@@ -493,6 +493,10 @@ pub(crate) fn init_metrics() {
         "smg_mcp_tool_iterations_total",
         "Tool loop iterations in Responses API by model"
     );
+    describe_counter!(
+        "smg_responses_stream_failures_total",
+        "Responses-surface mid-stream terminal failures by model and reason (backend_error/read_error)"
+    );
 
     // Layer 6: Database metrics
     describe_counter!(

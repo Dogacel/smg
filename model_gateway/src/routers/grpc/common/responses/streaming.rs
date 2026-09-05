@@ -297,6 +297,7 @@ impl ResponseStreamEventEmitter {
                 "id": std::mem::take(&mut self.message_id),
                 "type": "message",
                 "role": "assistant",
+                "status": "completed",
                 "content": [{
                     "type": "output_text",
                     "text": std::mem::take(&mut self.accumulated_text)
@@ -383,6 +384,16 @@ impl ResponseStreamEventEmitter {
         ) else {
             return;
         };
+        // A message that already completed normally keeps its text; only an
+        // item still in progress is closed as incomplete.
+        let already_completed = self
+            .output_items
+            .iter()
+            .any(|i| i.output_index == output_index && i.status == ItemStatus::Completed);
+        if already_completed {
+            self.forget_current_message();
+            return;
+        }
         let content_index = 0;
 
         if self.has_emitted_content_part_added {
@@ -407,8 +418,7 @@ impl ResponseStreamEventEmitter {
             let event = self.emit_output_item_done(output_index, &item);
             self.send_event_best_effort(&event, tx).await;
         }
-        self.current_message_output_index = None;
-        self.current_item_id = None;
+        self.forget_current_message();
     }
 
     /// Terminal failure: close any open message item as incomplete, then emit
@@ -416,49 +426,61 @@ impl ResponseStreamEventEmitter {
     /// output — completed and incomplete alike. Counterpart of
     /// [`Self::emit_completed`] for the mid-stream failure path.
     ///
-    /// Returns the failed response object so callers can persist exactly what
-    /// the client was shown.
+    /// Returns the typed failed response; the event payload is its
+    /// serialization, so what a caller persists is exactly what the client was
+    /// shown — including the response identity when the failure precedes the
+    /// first backend chunk.
     ///
-    /// INVARIANT: terminal — drains internal state via `take()` and must only
-    /// be called once per emitter lifetime (and never after `emit_completed`).
+    /// INVARIANT: terminal — drains internal state and must only be called once
+    /// per emitter lifetime (and never after `emit_completed`).
     pub async fn emit_failed(
         &mut self,
         code: &str,
         message: &str,
-        usage: Option<&serde_json::Value>,
+        usage: Option<Usage>,
         tx: &SseSender,
-    ) -> serde_json::Value {
+    ) -> ResponsesResponse {
         self.close_open_message_as_incomplete(tx).await;
 
         // Unlike emit_completed, incomplete items are included: dropping the
         // partial output is exactly the failure mode this event exists to fix.
-        let output: Vec<serde_json::Value> = self
-            .output_items
-            .iter_mut()
-            .filter_map(|item| item.item_data.take())
-            .collect();
-
-        let mut response_obj = json!({
-            "id": self.response_id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": "failed",
-            "model": self.model,
-            "error": {"code": code, "message": message},
-            "output": output
-        });
-        if let Some(usage_val) = usage {
-            response_obj["usage"] = usage_val.clone();
+        let failed = self.finalize_failed(code, message, usage);
+        for item in &mut self.output_items {
+            item.item_data = None;
         }
-        self.apply_request_echo_fields(&mut response_obj);
 
+        let response_obj = serde_json::to_value(&failed).unwrap_or_else(|e| {
+            warn!("Failed to serialize response.failed payload: {e}");
+            json!({
+                "id": failed.id,
+                "object": "response",
+                "status": "failed",
+                "model": failed.model,
+                "error": {"code": code, "message": message},
+                "output": []
+            })
+        });
         let event = json!({
             "type": ResponseEvent::FAILED,
             "sequence_number": self.next_sequence(),
-            "response": response_obj.clone()
+            "response": response_obj
         });
         self.send_event_best_effort(&event, tx).await;
-        response_obj
+        failed
+    }
+
+    /// Typed failed response built from the tracked items without draining
+    /// them: status `failed`, the error object, request echo fields and usage.
+    /// [`Self::emit_failed`] both emits and returns this.
+    pub fn finalize_failed(
+        &self,
+        code: &str,
+        message: &str,
+        usage: Option<Usage>,
+    ) -> ResponsesResponse {
+        let mut response = self.finalize_with_status(ResponseStatus::Failed, usage);
+        response.error = Some(json!({"code": code, "message": message}));
+        response
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
@@ -747,6 +769,10 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Mark output item as completed and store its data
+    ///
+    /// Completing the tracked message item also forgets it as the current
+    /// message, so a later terminal failure cannot re-close a finished item
+    /// with an empty incomplete replacement.
     pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
@@ -755,6 +781,27 @@ impl ResponseStreamEventEmitter {
         {
             item.status = ItemStatus::Completed;
         }
+        if self.current_message_output_index == Some(output_index) {
+            self.forget_current_message();
+        }
+    }
+
+    /// Register a message item that an external streaming processor opened via
+    /// [`Self::emit_output_item_added`], so a mid-stream failure can close it
+    /// as incomplete with the text accumulated through
+    /// [`Self::emit_text_delta`]. [`Self::complete_output_item`] clears it.
+    pub fn track_open_message(&mut self, output_index: usize, item_id: &str) {
+        self.current_message_output_index = Some(output_index);
+        self.current_item_id = Some(item_id.to_string());
+        self.has_emitted_output_item_added = true;
+    }
+
+    fn forget_current_message(&mut self) {
+        self.current_message_output_index = None;
+        self.current_item_id = None;
+        self.has_emitted_output_item_added = false;
+        self.has_emitted_content_part_added = false;
+        self.accumulated_text.clear();
     }
 
     /// Store output item data when emitting output_item.done
@@ -774,14 +821,33 @@ impl ResponseStreamEventEmitter {
     /// for persistence. Should be called after streaming is complete.
     /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
     pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
-        // Build output array from tracked items (clone — emit_completed drains later)
+        self.finalize_with_status(ResponseStatus::Completed, usage)
+    }
+
+    fn finalize_with_status(
+        &self,
+        status: ResponseStatus,
+        usage: Option<Usage>,
+    ) -> ResponsesResponse {
+        // Build output array from tracked items (clone — emit_completed drains later).
+        // An item that does not type-check is dropped from the persisted record,
+        // loudly: silent drops here hid a missing `status` on message items.
         let output: Vec<ResponseOutputItem> = self
             .output_items
             .iter()
             .filter_map(|item| {
-                item.item_data
-                    .as_ref()
-                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+                let data = item.item_data.as_ref()?;
+                match serde_json::from_value::<ResponseOutputItem>(data.clone()) {
+                    Ok(typed) => Some(typed),
+                    Err(e) => {
+                        warn!(
+                            output_index = item.output_index,
+                            error = %e,
+                            "Output item could not be typed for persistence; dropping it"
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -803,7 +869,7 @@ impl ResponseStreamEventEmitter {
         // Build response using builder
         ResponsesResponse::builder(&self.response_id, &self.model)
             .created_at(self.created_at as i64)
-            .status(ResponseStatus::Completed)
+            .status(status)
             .output(output)
             .maybe_copy_from_request(self.original_request.as_ref())
             .maybe_usage(responses_usage)
@@ -922,11 +988,14 @@ impl ResponseStreamEventEmitter {
                         }
 
                         if self.has_emitted_output_item_added {
-                            // Build complete message item for output_item.done
+                            // Build complete message item for output_item.done.
+                            // `status` is part of the wire shape and what lets the
+                            // item round-trip into the typed persisted response.
                             let item = json!({
                                 "id": item_id,
                                 "type": "message",
                                 "role": "assistant",
+                                "status": "completed",
                                 "content": [{
                                     "type": "output_text",
                                     "text": std::mem::take(&mut self.accumulated_text)
@@ -1211,7 +1280,112 @@ mod tests {
             Some(&json!("partial tex"))
         );
         // What the caller persists is exactly what the client was shown.
-        assert_eq!(&failed_obj, response);
+        assert_eq!(&serde_json::to_value(&failed_obj).unwrap(), response);
+    }
+
+    fn chunk_with_finish(reason: &str) -> ChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "chatcmpl_test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+        }))
+        .expect("valid chunk")
+    }
+
+    #[tokio::test]
+    async fn emit_failed_after_normal_completion_keeps_the_completed_message() {
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_c".to_string(), "test-model".to_string(), 1);
+        emitter
+            .process_chunk(&chunk_with_content("full answer"), &tx)
+            .await
+            .expect("delta events send");
+        emitter
+            .process_chunk(&chunk_with_finish("stop"), &tx)
+            .await
+            .expect("finish events send");
+
+        let failed = emitter
+            .emit_failed("stream_read_error", "socket closed", None, &tx)
+            .await;
+        drop(tx);
+
+        let events = drain_frames(&mut rx).await;
+        let done_ladders = events
+            .iter()
+            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some(OutputItemEvent::DONE))
+            .count();
+        // The finished message is closed exactly once — no second, empty ladder.
+        assert_eq!(done_ladders, 1);
+        let response = events.last().unwrap().get("response").unwrap();
+        assert_eq!(response.pointer("/status"), Some(&json!("failed")));
+        assert_eq!(
+            response.pointer("/output/0/status"),
+            Some(&json!("completed"))
+        );
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("full answer"))
+        );
+        assert_eq!(failed.output.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emit_failed_closes_a_message_tracked_by_an_external_processor() {
+        // Mirrors the Harmony processor: it allocates and streams the message
+        // item itself and only registers it with the emitter.
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_h".to_string(), "test-model".to_string(), 1);
+        let (output_index, item_id) = emitter.allocate_output_index(OutputItemKind::Message);
+        let item = json!({"id": item_id, "type": "message", "role": "assistant", "content": []});
+        let event = emitter.emit_output_item_added(output_index, &item);
+        emitter.send_event_best_effort(&event, &tx).await;
+        emitter.track_open_message(output_index, &item_id);
+        let event = emitter.emit_content_part_added(output_index, &item_id, 0);
+        emitter.send_event_best_effort(&event, &tx).await;
+        let event = emitter.emit_text_delta("partial fin", output_index, &item_id, 0);
+        emitter.send_event_best_effort(&event, &tx).await;
+
+        let failed = emitter
+            .emit_failed("processing_error", "decode died", None, &tx)
+            .await;
+        drop(tx);
+
+        let events = drain_frames(&mut rx).await;
+        let response = events.last().unwrap().get("response").unwrap();
+        assert_eq!(
+            response.pointer("/output/0/status"),
+            Some(&json!("incomplete"))
+        );
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("partial fin"))
+        );
+        assert!(matches!(failed.status, ResponseStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn emit_failed_before_any_chunk_keeps_the_response_identity() {
+        let (tx, _rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_id".to_string(), "test-model".to_string(), 7);
+        let failed = emitter
+            .emit_failed("stream_read_error", "boom", None, &tx)
+            .await;
+        // The persisted record carries the emitter's identity rather than empty
+        // placeholders from an accumulator that never saw a chunk.
+        assert_eq!(failed.id, "resp_id");
+        assert_eq!(failed.model, "test-model");
+        assert_eq!(failed.created_at, 7);
+        assert!(matches!(failed.status, ResponseStatus::Failed));
+        assert_eq!(
+            failed.error.as_ref().and_then(|e| e.get("code")),
+            Some(&json!("stream_read_error"))
+        );
     }
 
     #[tokio::test]
