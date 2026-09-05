@@ -192,8 +192,10 @@ impl ParserRegistry {
     /// `parallel_tool_calls`, or the inverse of Anthropic
     /// `disable_parallel_tool_use`); `Some(false)` bounds the JSON-schema
     /// fallback to a single call. Named-function constraints are single-call
-    /// by construction; structural tags are unaffected (tag grammars carry no
-    /// repeat bound).
+    /// by construction. Registry structural-tag builders do not currently set
+    /// a repeat bound (`stop_after_first`), so the setting is unenforced on
+    /// that path; the Harmony preparation stage builds its own tag and does
+    /// honor it.
     pub fn generate_tool_constraint(
         &self,
         configured_parser: Option<&str>,
