@@ -350,6 +350,13 @@ impl WorkerService {
                 })?;
         let url = existing.url().to_string();
 
+        // Same admission rule as creation: a replacement that would turn the
+        // worker into a provider target must fail here, not later in the
+        // background workflow after this call already answered 202.
+        if !self.router_config.providers_enabled() && Self::targets_provider(&config) {
+            return Err(WorkerServiceError::ProvidersDisabled { url: config.url });
+        }
+
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
         // for a single ID cannot express that, so refuse here instead of
@@ -662,6 +669,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_worker_rejects_provider_specs_when_providers_disabled() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker_id = registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://local:30000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ))
+            .expect("worker registers");
+        let service = make_service(registry);
+
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://local:30000",
+            "runtime_type": "external"
+        }))
+        .expect("worker spec");
+        let err = service
+            .replace_worker(worker_id.as_str(), spec)
+            .await
+            .expect_err("a replacement targeting a provider must be rejected up front");
+        assert!(matches!(err, WorkerServiceError::ProvidersDisabled { .. }));
+    }
+
+    #[tokio::test]
     async fn create_worker_admits_external_workers_when_providers_enabled() {
         let registry = Arc::new(WorkerRegistry::new());
         let service = WorkerService::new(
@@ -669,6 +700,7 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
             RouterConfig::builder()
                 .regular_mode(vec![])
+                .igw(true)
                 .providers(true)
                 .build_unchecked(),
         );

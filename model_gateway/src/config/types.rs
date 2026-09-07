@@ -1234,10 +1234,13 @@ impl RouterConfig {
 
     /// Whether provider routers may be registered and external workers admitted.
     ///
-    /// True when `enable_providers` is set or when the routing mode itself is a
-    /// provider mode, which cannot work without its router.
+    /// True when `enable_providers` is set in IGW mode, the only mode that
+    /// registers provider routers next to self-hosted ones, or when the routing
+    /// mode itself is a provider mode, which cannot work without its router. An
+    /// external worker admitted under any other configuration would have no
+    /// router to reach it.
     pub fn providers_enabled(&self) -> bool {
-        self.enable_providers
+        (self.enable_providers && self.enable_igw)
             || matches!(
                 self.mode,
                 RoutingMode::OpenAI { .. }
@@ -1364,14 +1367,24 @@ mod tests {
         assert!(!config.enable_providers);
         assert!(!config.providers_enabled());
 
-        // The flag round-trips.
+        // The flag round-trips and takes effect in IGW mode.
         let config = RouterConfig::builder()
             .regular_mode(vec![])
+            .igw(true)
             .providers(true)
             .build_unchecked();
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert!(with.enable_providers);
         assert!(with.providers_enabled());
+
+        // Outside IGW mode nothing registers a provider router, so the flag
+        // alone must not admit external workers.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .providers(true)
+            .build_unchecked();
+        assert!(!config.providers_enabled());
 
         // A provider routing mode implies it without the flag.
         let config = RouterConfig::builder()

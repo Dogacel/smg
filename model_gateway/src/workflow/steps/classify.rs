@@ -26,13 +26,14 @@ const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// External workers are reachable only through the provider routers, so a
 /// gateway that did not opt into providers must not classify anything as
-/// external. A missing app context (unit tests) admits everything.
+/// external. The verdict fails closed: without an app context to ask, which
+/// no production workflow lacks, nothing is admitted.
 fn external_workers_admitted(context: &WorkflowContext<WorkerWorkflowData>) -> bool {
     context
         .data
         .app_context
         .as_ref()
-        .is_none_or(|app_context| app_context.router_config.providers_enabled())
+        .is_some_and(|app_context| app_context.router_config.providers_enabled())
 }
 
 fn providers_disabled(url: &str) -> WorkflowError {
@@ -193,12 +194,96 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
     use axum::{routing::get, Json, Router};
+    use llm_tokenizer::registry::TokenizerRegistry;
+    use openai_protocol::worker::WorkerSpec;
     use reqwest::Client;
     use serde_json::json;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
     use tokio::net::TcpListener;
+    use wfaas::WorkflowInstanceId;
 
-    use super::probe_models_owned_by;
+    use super::*;
+    use crate::{
+        app_context::AppContext,
+        config::RouterConfig,
+        policies::PolicyRegistry,
+        worker::WorkerRegistry,
+        workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
+    };
+
+    fn app_context(providers: bool) -> Arc<AppContext> {
+        let router_config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .igw(providers)
+            .providers(providers)
+            .build_unchecked();
+        Arc::new(
+            AppContext::builder()
+                .client(Client::new())
+                .rate_limiter(None)
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .reasoning_parser_factory(None)
+                .tool_parser_factory(None)
+                .worker_registry(Arc::new(WorkerRegistry::new()))
+                .policy_registry(Arc::new(PolicyRegistry::new(router_config.policy.clone())))
+                .router_config(router_config)
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .worker_monitor(None)
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .expect("app context"),
+        )
+    }
+
+    fn context_for(
+        spec: serde_json::Value,
+        providers: bool,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        let config: WorkerSpec = serde_json::from_value(spec).expect("worker spec");
+        let data = create_worker_workflow_data(
+            config,
+            WorkerRegistrationMode::CreateOnly,
+            app_context(providers),
+        );
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    #[tokio::test]
+    async fn external_workers_are_refused_unless_providers_are_enabled() {
+        let step = ClassifyWorkerTypeStep;
+        let explicit = json!({"url": "https://example.internal:8443", "runtime_type": "external"});
+        let provider_url = json!({"url": "https://api.anthropic.com"});
+
+        // Providers off: both an explicit external runtime and a known
+        // provider URL fail the step instead of entering the registry.
+        for spec in [&explicit, &provider_url] {
+            let mut ctx = context_for(spec.clone(), false);
+            assert!(matches!(
+                step.execute(&mut ctx).await,
+                Err(WorkflowError::StepFailed { .. })
+            ));
+            assert_eq!(ctx.data.worker_kind, None);
+        }
+
+        // Providers on: both classify as external.
+        for spec in [&explicit, &provider_url] {
+            let mut ctx = context_for(spec.clone(), true);
+            assert!(matches!(
+                step.execute(&mut ctx).await,
+                Ok(StepResult::Success)
+            ));
+            assert_eq!(ctx.data.worker_kind, Some(WorkerKind::External));
+        }
+    }
 
     #[tokio::test]
     async fn probe_models_owned_by_accepts_nvidia_as_local() {

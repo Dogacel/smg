@@ -778,6 +778,15 @@ class RouterArgs:
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
         )
+        routing_group.add_argument(
+            f"--{prefix}enable-providers",
+            action="store_true",
+            help=(
+                "Register the third-party provider routers (OpenAI-compatible,"
+                " Anthropic, Gemini) and admit external workers; implied by"
+                " --backend openai|anthropic|gemini"
+            ),
+        )
 
         # PD/EPD-specific arguments
         pd_group.add_argument(
@@ -892,15 +901,6 @@ class RouterArgs:
                 "Per-request image-count limit applied to every model, replacing the"
                 " model spec's built-in limit (e.g. to match the engine's"
                 " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
-            ),
-        )
-        parser.add_argument(
-            f"--{prefix}enable-providers",
-            action="store_true",
-            help=(
-                "Register the third-party provider routers (OpenAI-compatible,"
-                " Anthropic, Gemini) and admit external workers; implied by"
-                " --backend openai|anthropic|gemini"
             ),
         )
 

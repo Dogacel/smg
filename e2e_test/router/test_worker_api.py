@@ -375,7 +375,12 @@ class TestIGWMixedWorkerClassification:
             gateway = Gateway()
             gateway.start(
                 igw_mode=True,
-                extra_args=["--worker-startup-timeout-secs", "300"],
+                extra_args=[
+                    "--worker-startup-timeout-secs",
+                    "300",
+                    # External workers are admitted only when providers are enabled.
+                    "--enable-providers",
+                ],
             )
 
             try:

@@ -2099,7 +2099,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli_args.enable_igw = true;
     }
 
-    if cli_args.enable_igw && !cli_args.enable_providers {
+    // A provider backend implies provider routing, so only a self-hosted
+    // IGW run without the flag is worth a line.
+    let provider_backend = matches!(
+        cli_args.backend,
+        Some(Backend::Openai | Backend::Anthropic | Backend::Gemini)
+    );
+    if cli_args.enable_igw && !cli_args.enable_providers && !provider_backend {
         println!(
             "INFO: provider routers are not registered; pass --enable-providers to proxy to \
              third-party providers"
@@ -2519,7 +2525,7 @@ mod tests {
 
     #[test]
     fn enable_providers_flows_into_both_configs() {
-        let cli = cli_args_from(&["--enable-providers"]);
+        let cli = cli_args_from(&["--enable-igw", "--enable-providers"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert!(router_config.enable_providers);
