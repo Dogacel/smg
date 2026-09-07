@@ -47,7 +47,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
-    endpoints::{conversations, parse, responses as response_handlers, tokenize},
+    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
@@ -136,7 +136,7 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.get_models(req).await
+    models::list_models(&state.context, req.headers()).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -1426,10 +1426,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // keys when falling back to simple API-key auth (no control-plane auth
     // configured) — a tenant credential must not be able to reach
     // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = AuthConfig::with_tenant_keys(
-        config.router_config.api_key.clone(),
-        &config.router_config.tenant_api_keys,
-    );
+    let serving_auth_config = app_context.gateway_auth.clone();
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured
