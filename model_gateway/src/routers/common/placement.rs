@@ -20,8 +20,8 @@ use tracing::{debug, warn};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, SelectWorkerInfo,
-        WorkerLeg,
+        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, RemoteOverlap,
+        SelectWorkerInfo, WorkerLeg,
     },
     routers::common::overload,
     worker::{ConnectionMode, ConnectionModeExt, RoutingPool, RuntimeType, Worker, WorkerRegistry},
@@ -49,6 +49,12 @@ pub(crate) struct PlacementInputs<'a> {
     pub rid_key: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
+    /// Prefetched shared-index overlap (`--kv-indexer-url`), resolved by
+    /// `PolicyRegistry::resolve_remote_overlap` before placement. Steers
+    /// the leg that holds the prompt prefix: the single worker, or the
+    /// prefill leg of a pair (decode never holds the prompt KV). `None`
+    /// when no index is wired or it produced nothing for this request.
+    pub remote_overlap: Option<&'a RemoteOverlap>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -180,8 +186,9 @@ pub(crate) fn select_from(
     let hash_ring = registry.get_hash_ring(model_id);
 
     // The registry applies the routing-key sticky override when enabled and
-    // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
+    // otherwise delegates to the configured policy, handing it the
+    // prefetched shared-index overlap when there is one.
+    let idx = policies.select_worker_with_remote(
         &policy,
         available,
         &SelectWorkerInfo {
@@ -194,6 +201,7 @@ pub(crate) fn select_from(
             hash_ring,
             leg: WorkerLeg::Single,
         },
+        inputs.remote_overlap,
     )?;
     let selected = available[idx].clone();
 
@@ -327,7 +335,12 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
+    // The prefill worker holds the prompt-prefix KV, so the shared-index
+    // overlap steers this leg only; decode never holds the prompt prefix
+    // and stays on the plain policy.
+    let Some(prefill_idx) =
+        policies.select_worker_with_remote(&prefill_policy, &prefill, &info, inputs.remote_overlap)
+    else {
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     info.leg = WorkerLeg::Decode;

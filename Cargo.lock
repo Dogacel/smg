@@ -7459,6 +7459,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-radix-index",
  "smg-wasm",
  "str0m",
  "tempfile",
