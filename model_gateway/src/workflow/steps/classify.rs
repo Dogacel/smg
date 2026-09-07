@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use openai_protocol::worker::ProviderType;
 use reqwest::Client;
 use tracing::debug;
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
@@ -23,6 +23,27 @@ use crate::{
 /// Quick-probe timeout for classification. Deliberately short — the full
 /// connection timeout is applied later by `DetectConnectionModeStep`.
 const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
+
+/// External workers are reachable only through the provider routers, so a
+/// gateway that did not opt into providers must not classify anything as
+/// external. A missing app context (unit tests) admits everything.
+fn external_workers_admitted(context: &WorkflowContext<WorkerWorkflowData>) -> bool {
+    context
+        .data
+        .app_context
+        .as_ref()
+        .is_none_or(|app_context| app_context.router_config.providers_enabled())
+}
+
+fn providers_disabled(url: &str) -> WorkflowError {
+    WorkflowError::StepFailed {
+        step_id: StepId::new("classify_worker_type"),
+        message: format!(
+            "worker {url} targets a third-party provider, but provider routing is disabled; \
+             start the gateway with --enable-providers to admit external workers"
+        ),
+    }
+}
 
 /// Known local backend `owned_by` values returned by `/v1/models`.
 const LOCAL_OWNED_BY: &[&str] = &["sglang", "vllm", "trtllm", "nvidia"];
@@ -93,6 +114,9 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             } else {
                 WorkerKind::Local
             };
+            if kind == WorkerKind::External && !external_workers_admitted(context) {
+                return Err(providers_disabled(&config.url));
+            }
             debug!(
                 "Worker {} explicitly configured as {} → {:?}",
                 config.url, config.runtime_type, kind
@@ -103,6 +127,9 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
 
         // 3. URL matches known cloud provider → External (no probing needed)
         if let Some(provider) = ProviderType::from_url(&config.url) {
+            if !external_workers_admitted(context) {
+                return Err(providers_disabled(&config.url));
+            }
             debug!(
                 "Worker {} URL matches known provider ({}) → External",
                 config.url, provider

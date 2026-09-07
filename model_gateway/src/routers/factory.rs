@@ -283,7 +283,7 @@ impl RouterFactory {
             _ => (None, None, None),
         };
 
-        vec![
+        let mut routers = vec![
             (
                 router_ids::HTTP_REGULAR,
                 "HTTP Regular",
@@ -307,22 +307,32 @@ impl RouterFactory {
                 Self::set_epd_policies(encode_policy, prefill_policy, decode_policy, policy, ctx);
                 Self::create_grpc_router(ctx, Mode::EncodePrefillDecode)
             }),
-            (
-                router_ids::HTTP_OPENAI,
-                "OpenAI",
-                Self::create_openai_router(ctx).await,
-            ),
-            (
-                router_ids::HTTP_ANTHROPIC,
-                "Anthropic",
-                Self::create_anthropic_router(ctx).await,
-            ),
-            (
-                router_ids::HTTP_GEMINI,
-                "Gemini",
-                Self::create_gemini_router(ctx).await,
-            ),
-        ]
+        ];
+
+        // The provider routers proxy to third-party APIs and forward the
+        // caller's credentials upstream, so they exist only when the operator
+        // opted in.
+        if ctx.router_config.providers_enabled() {
+            routers.extend([
+                (
+                    router_ids::HTTP_OPENAI,
+                    "OpenAI",
+                    Self::create_openai_router(ctx).await,
+                ),
+                (
+                    router_ids::HTTP_ANTHROPIC,
+                    "Anthropic",
+                    Self::create_anthropic_router(ctx).await,
+                ),
+                (
+                    router_ids::HTTP_GEMINI,
+                    "Gemini",
+                    Self::create_gemini_router(ctx).await,
+                ),
+            ]);
+        }
+
+        routers
     }
 }
 

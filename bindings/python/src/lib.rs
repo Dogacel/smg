@@ -528,6 +528,7 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    enable_providers: bool,
 }
 
 impl Router {
@@ -922,6 +923,7 @@ impl Router {
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
+            .providers(self.enable_providers)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1098,6 +1100,7 @@ impl Router {
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        enable_providers = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1251,6 +1254,7 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        enable_providers: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1418,6 +1422,7 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            enable_providers,
         })
     }
 

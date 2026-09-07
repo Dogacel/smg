@@ -680,6 +680,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn providers(mut self, enable: bool) -> Self {
+        self.config.enable_providers = enable;
+        self
+    }
+
     pub fn dp_minimum_tokens_scheduler(mut self, enable: bool) -> Self {
         self.config.dp_minimum_tokens_scheduler = enable;
         self

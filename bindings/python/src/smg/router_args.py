@@ -251,6 +251,9 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
+    # Register provider routers and admit external workers (implied by
+    # --backend openai|anthropic|gemini)
+    enable_providers: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -889,6 +892,15 @@ class RouterArgs:
                 "Per-request image-count limit applied to every model, replacing the"
                 " model spec's built-in limit (e.g. to match the engine's"
                 " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}enable-providers",
+            action="store_true",
+            help=(
+                "Register the third-party provider routers (OpenAI-compatible,"
+                " Anthropic, Gemini) and admit external workers; implied by"
+                " --backend openai|anthropic|gemini"
             ),
         )
 

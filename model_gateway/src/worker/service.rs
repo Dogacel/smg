@@ -11,7 +11,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::worker::{WorkerErrorResponse, WorkerInfo, WorkerSpec, WorkerUpdateRequest};
+use openai_protocol::worker::{
+    ProviderType, RuntimeType, WorkerErrorResponse, WorkerInfo, WorkerSpec, WorkerUpdateRequest,
+};
 use serde_json::json;
 use tracing::warn;
 
@@ -42,6 +44,8 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// The spec targets a third-party provider while provider routing is off
+    ProvidersDisabled { url: String },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -55,6 +59,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            Self::ProvidersDisabled { .. } => "PROVIDERS_DISABLED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -66,6 +71,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::ProvidersDisabled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -91,6 +97,11 @@ impl std::fmt::Display for WorkerServiceError {
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
                 )
             }
+            Self::ProvidersDisabled { url } => write!(
+                f,
+                "Worker '{url}' targets a third-party provider, but provider routing is \
+                 disabled. Start the gateway with --enable-providers to admit external workers."
+            ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
         }
@@ -268,6 +279,13 @@ impl WorkerService {
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
         validate_worker_url_request(&config.url)?;
 
+        // External workers are reachable only through the provider routers,
+        // which exist only when the operator opted in. Admitting one otherwise
+        // would leave it routable by nothing.
+        if !self.router_config.providers_enabled() && Self::targets_provider(&config) {
+            return Err(WorkerServiceError::ProvidersDisabled { url: config.url });
+        }
+
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
@@ -306,6 +324,14 @@ impl WorkerService {
             url: worker_url,
             location,
         })
+    }
+
+    /// Whether a spec describes a third-party provider rather than a self-hosted
+    /// engine: an explicit external runtime, a provider, or a known provider URL.
+    fn targets_provider(config: &WorkerSpec) -> bool {
+        config.runtime_type == RuntimeType::External
+            || config.provider.is_some()
+            || ProviderType::from_url(&config.url).is_some()
     }
 
     /// Replace a worker by ID (full replace, re-runs registration workflow)
@@ -607,6 +633,52 @@ mod tests {
             .expect_err("mixed-case scheme must be rejected at the boundary");
 
         assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_external_workers_when_providers_disabled() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "https://example.internal:8443",
+            "runtime_type": "external"
+        }))
+        .expect("worker spec");
+        let err = service
+            .create_worker(spec)
+            .await
+            .expect_err("external worker must be rejected while providers are disabled");
+        assert!(matches!(err, WorkerServiceError::ProvidersDisabled { .. }));
+        assert_eq!(err.error_code(), "PROVIDERS_DISABLED");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        // A known provider URL is rejected even without an explicit runtime type.
+        let err = service
+            .create_worker(worker_spec("https://api.anthropic.com"))
+            .await
+            .expect_err("provider URL must be rejected while providers are disabled");
+        assert!(matches!(err, WorkerServiceError::ProvidersDisabled { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_worker_admits_external_workers_when_providers_enabled() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = WorkerService::new(
+            registry,
+            Arc::new(std::sync::OnceLock::new()),
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .providers(true)
+                .build_unchecked(),
+        );
+
+        // Passes admission and stops at the uninitialized queue.
+        let err = service
+            .create_worker(worker_spec("https://api.openai.com"))
+            .await
+            .expect_err("queue is uninitialized in the test harness");
+        assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
     }
 
     #[tokio::test]

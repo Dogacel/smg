@@ -451,6 +451,12 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
+    /// Register the third-party provider routers (OpenAI-compatible, Anthropic,
+    /// Gemini) and admit external workers. Implied by --backend
+    /// openai|anthropic|gemini; off by default for self-hosted deployments
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    enable_providers: bool,
+
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
@@ -1912,6 +1918,7 @@ impl CliArgs {
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .providers(self.enable_providers)
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
@@ -2090,6 +2097,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli_args.service_discovery && !cli_args.enable_igw {
         println!("INFO: IGW mode automatically enabled because service discovery is turned on");
         cli_args.enable_igw = true;
+    }
+
+    if cli_args.enable_igw && !cli_args.enable_providers {
+        println!(
+            "INFO: provider routers are not registered; pass --enable-providers to proxy to \
+             third-party providers"
+        );
     }
 
     let mode_str = if cli_args.enable_igw {
@@ -2501,6 +2515,32 @@ mod tests {
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
         );
+    }
+
+    #[test]
+    fn enable_providers_flows_into_both_configs() {
+        let cli = cli_args_from(&["--enable-providers"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.enable_providers);
+        assert!(router_config.providers_enabled());
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.providers_enabled());
+    }
+
+    #[test]
+    fn provider_backend_implies_enable_providers() {
+        let cli = cli_args_from(&[
+            "--backend",
+            "openai",
+            "--worker-urls",
+            "https://api.openai.com",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.enable_providers);
+        assert!(router_config.providers_enabled());
     }
 
     /// The overload thresholds must reach `RouterConfig` and survive nesting

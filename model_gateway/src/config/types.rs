@@ -216,6 +216,12 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    /// Register the third-party provider routers (OpenAI-compatible, Anthropic,
+    /// Gemini) in IGW mode and admit external workers. Off by default so a
+    /// self-hosted deployment never proxies to a cloud provider by accident.
+    /// Implied by the openai, anthropic and gemini routing modes.
+    #[serde(default)]
+    pub enable_providers: bool,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -1130,6 +1136,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            enable_providers: false,
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
             zmq_engine_count: None,
@@ -1223,6 +1230,20 @@ impl RouterConfig {
     /// Check if running in IGW (Inference Gateway) mode
     pub fn is_igw_mode(&self) -> bool {
         self.enable_igw
+    }
+
+    /// Whether provider routers may be registered and external workers admitted.
+    ///
+    /// True when `enable_providers` is set or when the routing mode itself is a
+    /// provider mode, which cannot work without its router.
+    pub fn providers_enabled(&self) -> bool {
+        self.enable_providers
+            || matches!(
+                self.mode,
+                RoutingMode::OpenAI { .. }
+                    | RoutingMode::Anthropic { .. }
+                    | RoutingMode::Gemini { .. }
+            )
     }
 }
 
@@ -1332,6 +1353,32 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    #[test]
+    fn test_enable_providers_serde_default_and_mode_implication() {
+        // Config files predating the field deserialize to "off".
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("enable_providers");
+        let config: RouterConfig = serde_json::from_value(json).unwrap();
+        assert!(!config.enable_providers);
+        assert!(!config.providers_enabled());
+
+        // The flag round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .providers(true)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert!(with.providers_enabled());
+
+        // A provider routing mode implies it without the flag.
+        let config = RouterConfig::builder()
+            .openai_mode(vec![])
+            .build_unchecked();
+        assert!(!config.enable_providers);
+        assert!(config.providers_enabled());
     }
 
     #[test]
