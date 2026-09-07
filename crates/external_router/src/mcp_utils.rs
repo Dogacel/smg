@@ -257,9 +257,20 @@ pub fn collect_user_function_names(request: &ResponsesRequest) -> HashSet<String
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .filter_map(|tool| match tool {
-            ResponseTool::Function(function_tool) => Some(function_tool.function.name.clone()),
-            _ => None,
+        .flat_map(|tool| match tool {
+            ResponseTool::Function(function_tool) => vec![function_tool.function.name.clone()],
+            ResponseTool::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .filter_map(|member| {
+                    if let openai_protocol::responses::NamespaceTool::Function(ft) = member {
+                        Some(format!("{}.{}", namespace.name, ft.function.name))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -983,5 +994,25 @@ mod tests {
                 "expected user injection for format {format:?}"
             );
         }
+    }
+    #[test]
+    fn collect_namespace_function_names_preserves_user_routing() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model", "input": "Check the weather",
+            "tools": [
+                {"type": "namespace", "name": "weather", "description": "Weather tools", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {}}
+                ]},
+                {"type": "namespace", "name": "travel", "description": "Travel tools", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let names = collect_user_function_names(&request);
+        assert_eq!(
+            names,
+            HashSet::from(["weather.lookup".into(), "travel.lookup".into()])
+        );
     }
 }
