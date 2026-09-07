@@ -65,6 +65,7 @@ use crate::{
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
+        external::GatewayWorker,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
             request_body::{serialize_request_body, RequestBodyError},
@@ -301,7 +302,7 @@ impl Router {
             body.set_model(canonical_model.to_string());
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                worker,
+                worker.map(GatewayWorker::handle),
                 headers,
                 &body,
                 model,
@@ -312,7 +313,7 @@ impl Router {
         } else {
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                worker,
+                worker.map(GatewayWorker::handle),
                 headers,
                 body,
                 model,
@@ -2034,7 +2035,7 @@ impl RouterTrait for Router {
             RealtimeLabels::HTTP,
             parts,
             model.to_owned(),
-            worker,
+            worker.map(GatewayWorker::handle),
             auth_header,
             Arc::clone(&self.realtime_registry),
         )
@@ -2083,7 +2084,7 @@ impl RouterTrait for Router {
             RealtimeLabels::HTTP,
             parts.headers,
             parsed,
-            worker,
+            worker.map(GatewayWorker::handle),
             auth_header,
             bind_addr,
             self.webrtc_stun_server.clone(),
