@@ -232,14 +232,19 @@ pub(crate) async fn try_smg_worker_reachable(
         // The Router decides string-stop ownership from this attribute (see
         // `smg_worker_uses_token_only_wire`); a Worker that omits it cannot
         // be routed to safely, so refuse it here where the message can say so.
+        // The label it becomes is derived from the first engine only, so the
+        // engines must also agree: a mixed-transport Worker would register
+        // with whichever answer engines[0] gives and be wrong for the rest.
+        let mut transports = std::collections::BTreeSet::new();
         for engine in &topology.engines {
             match engine
                 .attributes
                 .get("engine_transport")
                 .map(|value| value.to_ascii_lowercase())
-                .as_deref()
             {
-                Some("grpc" | "zmq") => {}
+                Some(transport) if transport == "grpc" || transport == "zmq" => {
+                    transports.insert(transport);
+                }
                 Some(other) => {
                     return Err(format!(
                         "SMG Worker engine {:?} advertises unknown engine_transport {other:?}; \
@@ -256,6 +261,13 @@ pub(crate) async fn try_smg_worker_reachable(
                     ))
                 }
             }
+        }
+        if transports.len() > 1 {
+            return Err(format!(
+                "SMG Worker engines disagree on engine_transport ({}); one Worker must front a \
+                 single wire because the Router's string-stop decision is per Worker",
+                transports.into_iter().collect::<Vec<_>>().join(", ")
+            ));
         }
 
         let engines = topology
