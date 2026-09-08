@@ -1,7 +1,7 @@
 """Conversion of TokenSpeed scheduler load replies into the gateway's protobuf.
 
 Kept free of engine imports so the field mapping can be unit-tested without
-TokenSpeed installed (see grpc_servicer/tests/test_tokenspeed_get_loads.py),
+TokenSpeed installed (see grpc_servicer/tests/test_tokenspeed_loads.py),
 the same split the SGLang side uses.
 """
 

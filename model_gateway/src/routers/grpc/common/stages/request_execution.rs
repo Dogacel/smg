@@ -97,6 +97,17 @@ enum PdDispatchOutcome {
     },
 }
 
+/// Backend requests one plan dispatches — one per batched prompt, else one.
+///
+/// This is both the load-guard scale and the number of PD bootstrap rooms the
+/// plan will post, which is why admission and the guards read the same count.
+fn plan_sub_requests(plan: &ExecutionPlan) -> usize {
+    match plan {
+        ExecutionPlan::Batch { requests, .. } => requests.len(),
+        _ => 1,
+    }
+}
+
 /// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
 fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     match workers {
@@ -120,6 +131,30 @@ pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     execution_plan: ExecutionPlan,
 ) -> Result<(), Response> {
+    // One bootstrap room per backend request the plan will post: a batched
+    // completion fans out one PD dispatch per sub-request, so admission has
+    // to claim for all of them or the siblings walk past a gate that only
+    // ever asked about one.
+    let sub_requests = plan_sub_requests(&execution_plan);
+
+    // Admission runs before this attempt claims anything else. The decode
+    // leg's engine window is what clears the prefill's bootstrap deadline, so
+    // a request the decode cannot admit yet waits here rather than in the
+    // engine's queue — where it would burn the prefill's deadline and strand
+    // both rooms. Waiting ahead of the encode take below also keeps the
+    // encode jobs' SHM unclaimed for the duration: under the burst this gate
+    // targets, holding it would queue a second scarce resource behind the
+    // decode window and throw the finished encode work away on a shed. The
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
+
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards
     // here: dispatch consumes them, while an early error before dispatch
@@ -148,26 +183,9 @@ pub(crate) async fn execute_plan(
         )
     })?;
 
-    // Admission for a disaggregated pair: the decode leg's engine window is
-    // what clears the prefill's bootstrap deadline, so a request the decode
-    // cannot admit yet must wait here rather than in the engine's queue —
-    // where it would burn the prefill's deadline and strand both rooms. The
-    // gate abstains when the engine reports no window, and returns with the
-    // slot still free: the load guards below claim it with no await between.
-    if let Some(decode) = workers.decode_worker() {
-        if let Some(shed) = pd_admission::admit_decode(decode.as_ref(), &ctx.model_id).await {
-            return Err(shed);
-        }
-    }
-
-    let sub_requests = match &execution_plan {
-        ExecutionPlan::Batch { requests, .. } => requests.len(),
-        _ => 1,
-    };
-    ctx.load_guards = Some(LoadGuards::scaled(
-        workers,
-        ctx.sticky_key.as_deref(),
-        sub_requests,
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
@@ -997,6 +1015,24 @@ mod tests {
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
         }
+    }
+
+    /// Admission and the load guards read the same count, so a batched plan
+    /// claims one room per prompt instead of walking past a gate that only
+    /// asked about one.
+    #[test]
+    fn plan_sub_requests_counts_every_batched_prompt() {
+        let single = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        assert_eq!(plan_sub_requests(&single), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: (0..4)
+                .map(|_| ProtoGenerateRequest::Vllm(Box::default()))
+                .collect(),
+        };
+        assert_eq!(plan_sub_requests(&batch), 4);
     }
 
     #[test]

@@ -602,6 +602,8 @@ impl RequestPipeline {
             );
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
+            // This releases its PD admission claim too, so the retry is not
+            // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
 
             let Some(config) = retry_config else {
