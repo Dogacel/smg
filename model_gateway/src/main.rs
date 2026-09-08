@@ -845,16 +845,16 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Let workers recover after prolonged failure: a worker that stays
-    /// unhealthy long enough is removed from the registry so service
-    /// discovery re-registers and re-probes it once its engine returns
-    /// (without this, a worker unreachable for ~12 minutes reaches a
-    /// terminal Failed state and is never probed again). Defaults to the
-    /// --service-discovery setting: recovery works by removal plus
-    /// discovery re-registration, so discovery-managed fleets get it for
-    /// free, while without discovery nothing would re-add the worker and
-    /// removal would permanently shrink a static fleet. Pass =false to
-    /// keep it off under discovery.
+    /// Recover failed workers by removal: a worker that stays unhealthy
+    /// long enough (Failed, ~12 minutes at the default thresholds) is
+    /// removed from the registry so service discovery re-registers and
+    /// re-probes it once its engine returns. Without this a Failed worker
+    /// stays registered, out of rotation, and keeps being probed, so it
+    /// rejoins in place as soon as it answers again. Defaults to the
+    /// --service-discovery setting: discovery-managed fleets recover by
+    /// removal plus re-registration, while a static fleet has nothing to
+    /// re-add a removed worker and recovers in place instead. Pass =false
+    /// to keep it off under discovery.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",

@@ -931,8 +931,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Let workers recover after prolonged failure: removal re-enters them
-    /// through service discovery once their engine returns.
+    /// Recover failed workers by removal: they re-enter through service
+    /// discovery once their engine returns. Off, a Failed worker stays
+    /// registered and probed, and rejoins in place when it answers again.
     #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
