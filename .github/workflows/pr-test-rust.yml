@@ -17,11 +17,13 @@ on:
 permissions:
   contents: read
 
-# Per-PR groups cancel superseded runs; pushes to main key on the commit SHA so
-# every commit on main gets its own run and is never cancelled by a later push.
+# One group per PR and one for main: a newer push cancels the superseded run.
+# On main this tests HEAD rather than every intermediate commit: back-to-back
+# merges otherwise stack full GPU matrices on one runner pool and time each
+# other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+  cancel-in-progress: true
 
 env:
   RUSTC_WRAPPER: sccache
@@ -328,6 +330,18 @@ jobs:
           rustup component add clippy
           cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Lint the self-hosted-only build (no provider routers)
+        # Meaningful only because the crate's self dev-dependency disables
+        # default features; see model_gateway/Cargo.toml.
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats --all-targets -- -D warnings
+
+      - name: Lint a single-provider build (Anthropic only)
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic --all-targets -- -D warnings
+
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"
@@ -335,11 +349,18 @@ jobs:
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
 
+      # --strict makes a fixture that fails to generate fail this step (the Rust
+      # golden tests skip a missing fixture directory, so a silent skip here
+      # would silently drop coverage). The step does not block the Rust tests,
+      # because a transient hub or pip failure should still leave a test
+      # signal; the outcome is re-raised after the tests run.
       - name: Generate vision golden fixtures
+        id: vision-golden
+        continue-on-error: true
         run: |
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install transformers pillow numpy scipy
-          python crates/multimodal/scripts/generate_vision_golden.py
+          python crates/multimodal/scripts/generate_vision_golden.py --strict
 
       - name: Create isolated Postgres test database
         # No continue-on-error here: the Postgres regression suite must
@@ -375,6 +396,12 @@ jobs:
           cargo test
           cargo test -p data-connector --test postgres_integration -- --ignored --test-threads=1
 
+      - name: Fail if vision golden fixtures did not generate
+        if: steps.vision-golden.outcome == 'failure'
+        run: |
+          echo "::error::Vision golden fixture generation failed; see the 'Generate vision golden fixtures' step"
+          exit 1
+
       - name: Cleanup Postgres test database
         if: always()
         run: bash scripts/ci_agentic_svc_deps.sh cleanup-postgres-db postgres-db
@@ -385,10 +412,16 @@ jobs:
 
   # --- Benchmarks (standalone) ---
 
+  # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
+  # a shared runner pool and sit inside its noise band, so a miss is a warning,
+  # not a merge blocker: it shows up as a warning annotation and in the step
+  # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
+  # uploaded and summarized.
   benchmarks:
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    continue-on-error: true
     timeout-minutes: 36
     permissions:
       contents: read
@@ -479,14 +512,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve the prebuilt TokenSpeed CI image (built by
+      # Resolve the prebuilt TokenSpeed carrier image (built by
       # ci-tokenspeed-image.yml, content-addressed by the pinned engine ref +
-      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). Any
-      # failure — a missing image (e.g. a PR that bumps the ref or edits the
-      # tooling before the image exists), a broken ref file, a registry
-      # hiccup — resolves to empty, and the tokenspeed lanes fall back to the
-      # plain CI container + source build. This step must NEVER fail the job:
-      # a failed detect-changes silently skips every gated lane.
+      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). The
+      # lanes run bare on the runner pods, so the image is not a job
+      # container: setup-tokenspeed extracts its payload onto the runner
+      # (scripts/ci_fetch_tokenspeed_prebuilt.sh). Any failure — a missing
+      # image (e.g. a PR that bumps the ref or edits the tooling before the
+      # image exists), a broken ref file, a registry hiccup — resolves to
+      # empty, and the tokenspeed lanes fall back to the source build. This
+      # step must NEVER fail the job: a failed detect-changes silently skips
+      # every gated lane.
       - name: Resolve TokenSpeed CI image
         id: tokenspeed-image
         env:
@@ -523,6 +559,7 @@ jobs:
               - '.github/workflows/pr-test-rust.yml'
               - '.github/workflows/e2e-gpu-job.yml'
               - 'scripts/ci_setup_python_venv.sh'
+              - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
@@ -555,6 +592,7 @@ jobs:
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
               - 'scripts/ci_tokenspeed_image_tag.sh'
+              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
               - '.github/versions/tokenspeed.ref'
             agentic:
               - 'crates/mcp/**'
@@ -625,8 +663,8 @@ jobs:
             test_timeout: 18
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
-            timeout: 32
-            test_timeout: 18
+            timeout: 36
+            test_timeout: 24
             min_selected: 180 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # tokenspeed builds from source (~30m cold), so keep the job
           # timeout generous even though the test step is short.
@@ -635,9 +673,9 @@ jobs:
           # installs sglang/vllm only. The engine marker filter keeps the
           # rest of e2e_test/router out of this job.
           - engine: tokenspeed
-            timeout: 50
-            test_timeout: 18
-            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            timeout: 56
+            test_timeout: 26
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -648,7 +686,7 @@ jobs:
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-chat-zmq:
@@ -678,8 +716,8 @@ jobs:
             test_timeout: 40
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: tokenspeed
-            timeout: 50
-            test_timeout: 40
+            timeout: 60
+            test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -691,7 +729,7 @@ jobs:
       test_dirs: e2e_test/chat_completions
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
@@ -739,7 +777,7 @@ jobs:
       connection_mode: zmq
       zmq_engine_count: "2"
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -878,8 +916,8 @@ jobs:
       engine: sglang
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
-      timeout: 28
-      test_timeout: 20
+      timeout: 32
+      test_timeout: 24
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
@@ -901,24 +939,39 @@ jobs:
       matrix:
         include:
           - engine: sglang
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # TokenSpeed prefill/decode over its Mooncake transfer, on the model
+          # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
+          # First run (34173426995): sequential PD passed; 32 concurrent
+          # requests deadlocked both legs because the spec's engine window was
+          # 4 (prefill waits for a decode that is never admitted). The window
+          # now covers the suite's bursts; the over-window deadlock itself is
+          # pinned by the topology suite. The prebuilt image is extracted, but
+          # a cold path builds from source, hence the larger budgets.
+          - engine: tokenspeed
+            timeout: 75
+            test_timeout: 50
+            min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "2"
       runner: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout || 34 }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}
+      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   # === 4 GPU ===
@@ -975,7 +1028,7 @@ jobs:
       test_dirs: e2e_test/chat_completions/test_epd_multimodal.py
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
-      container_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
+      tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
     secrets: inherit
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
@@ -1002,12 +1055,14 @@ jobs:
             test_path: e2e_test/messages
             timeout: 20
             setup_agentic_deps: true
+            external_tests: true
 
           - name: openai-responses
             vendor: openai
             test_path: e2e_test/responses
             timeout: 30
             setup_agentic_deps: true
+            external_tests: true
 
           - name: openai-realtime
             vendor: openai
@@ -1077,6 +1132,20 @@ jobs:
         run: |
           ROUTER_LOCAL_MODEL_PATH="/models" pytest ${{ matrix.test_path }} \
             -m "not external" \
+            --reruns 2 --reruns-delay 5 \
+            -s -vv
+
+      # Tests that depend on services beyond the vendor API itself (hosted
+      # tool execution, web search) fail for reasons this repo cannot fix, so
+      # they report but never gate.
+      - name: Run external-service E2E tests (advisory)
+        if: matrix.external_tests
+        continue-on-error: true
+        env:
+          BRAVE_MCP_HOST: brave-search-mcp
+        run: |
+          ROUTER_LOCAL_MODEL_PATH="/models" pytest ${{ matrix.test_path }} \
+            -m external \
             --reruns 2 --reruns-delay 5 \
             -s -vv
 
@@ -1328,7 +1397,6 @@ jobs:
                 "${{ needs.build-wheel.result }}" == "failure" || \
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
-                "${{ needs.benchmarks.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
@@ -1353,7 +1421,7 @@ jobs:
   summarize-benchmarks:
     needs: [benchmarks]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    if: success()
+    if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
     permissions:
       contents: read
     steps:

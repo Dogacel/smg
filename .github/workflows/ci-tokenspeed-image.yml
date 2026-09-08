@@ -1,11 +1,13 @@
 name: CI TokenSpeed Image
 
-# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) on top of
-# the plain GPU CI container and pushes it under the content-addressed tag
-# printed by scripts/ci_tokenspeed_image_tag.sh (engine ref + a hash of the
-# image tooling). The tokenspeed e2e lanes in pr-test-rust.yml pull this
-# image (resolved in detect-changes) instead of spending ~25
-# GPU-runner-minutes compiling from source in every job.
+# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) into a
+# runner-matched carrier image (ubuntu:24.04 — the GPU e2e jobs run bare on
+# the runner pods, so this is extracted at job time, not used as a job
+# container; see docker/ci-tokenspeed.Dockerfile) and pushes it under the
+# content-addressed tag printed by scripts/ci_tokenspeed_image_tag.sh
+# (engine ref + a hash of the image tooling). The tokenspeed e2e lanes in
+# pr-test-rust.yml pull this image (resolved in detect-changes) instead of
+# spending ~25 GPU-runner-minutes compiling from source in every job.
 #
 # The kernel compile needs nvcc but no GPU (arch list is pinned in
 # scripts/ci_install_tokenspeed.sh), so this runs on the docker runner pool.
@@ -15,6 +17,9 @@ name: CI TokenSpeed Image
 # doesn't exist yet, detect-changes resolves an empty image, and the lanes
 # degrade gracefully. This workflow builds the new tag on merge, and every
 # subsequent run is fast again.
+#
+# Retention: each tag is ~8 GB and nothing can pull a superseded one, so the
+# prune job below keeps the newest few and deletes the rest.
 
 on:
   push:
@@ -23,6 +28,7 @@ on:
       - '.github/versions/tokenspeed.ref'
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_install_tokenspeed.sh'
+      - 'scripts/ci_retry.sh'
       - 'scripts/ci_setup_python_venv.sh'
       - 'scripts/ci_tokenspeed_image_tag.sh'
       - '.github/workflows/ci-tokenspeed-image.yml'
@@ -33,7 +39,7 @@ on:
         default: false
         type: boolean
       base_image:
-        description: 'Base image override (default: vars.SMG_CI_GPU_CONTAINER_IMAGE)'
+        description: 'Base image override (default: ubuntu:24.04, matching the runner pods)'
         required: false
         type: string
 
@@ -58,16 +64,13 @@ jobs:
         id: resolve
         env:
           BASE_OVERRIDE: ${{ inputs.base_image }}
-          BASE_DEFAULT: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
         run: |
           # Unlike the tolerant resolution in detect-changes, THIS workflow
           # must fail loudly on a broken ref — its whole job is the image.
           tag="$(bash scripts/ci_tokenspeed_image_tag.sh)"
-          base="${BASE_OVERRIDE:-$BASE_DEFAULT}"
-          if [ -z "$base" ]; then
-            echo "ERROR: no base image (vars.SMG_CI_GPU_CONTAINER_IMAGE unset and no override)" >&2
-            exit 1
-          fi
+          # ubuntu:24.04 matches the runner pods (see the Dockerfile's
+          # portability contract); the dispatch input can override it.
+          base="${BASE_OVERRIDE:-ubuntu:24.04}"
           image="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"
@@ -122,3 +125,33 @@ jobs:
         run: |
           docker rmi "$IMAGE" || true
           docker rmi "$BASE" || true
+
+  # Superseded tags are unreachable by construction (the tag is a hash of its
+  # own inputs), so this runs whenever the tag resolves — after a fresh push
+  # and after a no-op run that found the tag already present. Split out onto
+  # the CPU pool because that is where the gh CLI is available.
+  prune:
+    needs: [build-and-push]
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &>/dev/null; then
+            mkdir -p "$HOME/.local/bin"
+            GH_VERSION="2.74.0"
+            GH_SHA256="e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89"
+            curl -fsSL --connect-timeout 10 --max-time 120 -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum --check --quiet
+            tar xzf /tmp/gh.tgz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Prune superseded images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci_prune_tokenspeed_images.sh
