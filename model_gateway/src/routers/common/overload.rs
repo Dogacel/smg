@@ -22,8 +22,8 @@ use crate::{
     routers::{common::retry::mark_non_retryable, error},
     worker::{
         overload::{
-            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, STAGE_DISPATCH,
-            STAGE_SELECTION,
+            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
+            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
@@ -87,6 +87,25 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
         url,
         format!("Worker '{url}' for model '{model_id}' became overloaded before dispatch"),
     ))
+}
+
+/// Shed a disaggregated dispatch the decode leg cannot admit: it is already
+/// running `window` requests and no slot freed inside the admission wait.
+///
+/// Same client-visible answer as the two vetoes above — the request was never
+/// sent, and the wait already outlived any backoff a retry would add — under
+/// its own decision branch, because here the *pair* is full rather than a
+/// threshold being crossed.
+pub(crate) fn shed_pd_admission(worker: &str, model_id: &str, window: usize) -> Response {
+    shed(
+        BRANCH_PD_ADMISSION_SHED,
+        STAGE_PD_ADMISSION,
+        worker,
+        format!(
+            "Decode worker '{worker}' for model '{model_id}' is running its full \
+             admission window ({window}) and no slot freed in time"
+        ),
+    )
 }
 
 /// One decision line, one counter, one response — marked non-retryable: the

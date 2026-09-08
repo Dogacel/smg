@@ -403,19 +403,26 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the `max_running_requests` label populated by the metadata
-    /// discovery pipeline (Step 4 of the worker lifecycle). Returns
-    /// `None` when the worker hasn't reported a value or reports zero
-    /// (zero is meaningless for capacity accounting).
+    /// Reads the running-window label populated by the metadata discovery
+    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
+    /// worker hasn't reported a value or reports zero (zero is meaningless
+    /// for capacity accounting).
+    ///
+    /// Engines spell the same window two ways — SGLang and vLLM advertise
+    /// `max_running_requests`, TokenSpeed advertises `max_num_seqs` — and
+    /// both are the count of requests the scheduler will run at once, so
+    /// both are read here rather than leaving TokenSpeed workers looking
+    /// like non-reporters.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
-    /// estimate otherwise.
+    /// estimate otherwise. The PD admission gate uses it as the decode
+    /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        self.metadata()
-            .spec
-            .labels
+        let labels = &self.metadata().spec.labels;
+        labels
             .get("max_running_requests")
+            .or_else(|| labels.get("max_num_seqs"))
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|n| *n > 0)
     }
@@ -2029,6 +2036,32 @@ mod tests {
             .build();
         // Zero is meaningless for capacity; treat as "not reported".
         assert_eq!(worker.max_running_requests(), None);
+    }
+
+    #[test]
+    fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+        use crate::worker::BasicWorkerBuilder;
+        // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
+        // without this a TokenSpeed worker looks like a non-reporter to both
+        // fleet capacity and PD admission.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_max_running_requests_prefers_the_canonical_label() {
+        use crate::worker::BasicWorkerBuilder;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_running_requests".to_string(), "256".to_string());
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(256));
     }
 
     #[test]
