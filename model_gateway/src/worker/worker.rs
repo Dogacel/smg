@@ -1883,21 +1883,23 @@ impl Worker for BasicWorker {
                             "SMG Worker reports DEGRADED; keeping it in rotation"
                         );
                     }
-                    // Draining rejects new work immediately, so take the worker
-                    // out of rotation now instead of after `failure_threshold`
-                    // more probes -- every request placed on it meanwhile is a
-                    // 503. The readiness machine still owns recovery: a Worker
-                    // that comes back SERVING re-admits through NotReady.
+                    // Draining rejects new work immediately, so the worker must
+                    // leave rotation on this probe instead of after
+                    // `failure_threshold` more -- every request placed on it
+                    // meanwhile is a 503. Report it as its own outcome rather
+                    // than writing status here: `apply_probe_completion` owns
+                    // status writes, behind the revision check that discards a
+                    // stale probe after a same-URL replacement, and resets the
+                    // failure counter so the liveness budget is not shortened.
                     WorkerHealthState::Draining => {
-                        if self.status() == WorkerStatus::Ready {
-                            tracing::warn!(
-                                worker_url = %self.metadata.spec.url,
-                                control_url,
-                                "SMG Worker is DRAINING; removing it from rotation"
-                            );
-                            self.set_status(WorkerStatus::NotReady);
-                        }
-                        return Ok(false);
+                        tracing::warn!(
+                            worker_url = %self.metadata.spec.url,
+                            control_url,
+                            "SMG Worker is DRAINING"
+                        );
+                        return Err(WorkerError::Draining {
+                            url: self.metadata.spec.url.clone(),
+                        });
                     }
                     WorkerHealthState::Starting
                     | WorkerHealthState::NotServing
@@ -2239,7 +2241,7 @@ mod tests {
         routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant},
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            manager::compute_next_status,
+            manager::{compute_next_status, ProbeOutcome},
             BasicWorkerBuilder,
         },
     };
@@ -2453,6 +2455,86 @@ mod tests {
 
     /// Serve `control` on an ephemeral port until the returned handle is
     /// aborted, and hand back the address to point a worker at.
+    /// A Worker whose `GetHealth` answers a fixed state, for the probe's
+    /// state mapping.
+    struct FixedStateWorkerControl(WorkerHealthState);
+
+    #[tonic::async_trait]
+    impl WorkerControlService for FixedStateWorkerControl {
+        async fn get_identity(
+            &self,
+            _request: Request<GetIdentityRequest>,
+        ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
+            Ok(Response::new(worker_proto::GetIdentityResponse {
+                identity: Some(worker_proto::WorkerIdentity {
+                    worker_id: "worker-a".to_string(),
+                    instance_id: "instance-a".to_string(),
+                    ..Default::default()
+                }),
+            }))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<worker_proto::GetCapabilitiesRequest>,
+        ) -> Result<Response<worker_proto::GetCapabilitiesResponse>, Status> {
+            Err(Status::unimplemented("not needed by health mapping tests"))
+        }
+
+        async fn get_health(
+            &self,
+            _request: Request<GetHealthRequest>,
+        ) -> Result<Response<worker_proto::GetHealthResponse>, Status> {
+            Ok(Response::new(worker_proto::GetHealthResponse {
+                state: self.0.into(),
+                message: "fixed".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_topology(
+            &self,
+            _request: Request<worker_proto::GetTopologyRequest>,
+        ) -> Result<Response<worker_proto::GetTopologyResponse>, Status> {
+            Err(Status::unimplemented("not needed by health mapping tests"))
+        }
+    }
+
+    #[tokio::test]
+    async fn smg_health_maps_worker_states_instead_of_collapsing_them() {
+        let probe = |state: WorkerHealthState| async move {
+            let (address, server) = spawn_worker_control(FixedStateWorkerControl(state));
+            let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    timeout_secs: 2,
+                    ..HealthCheckConfig::default()
+                })
+                .build();
+            let result = worker.check_health_async().await;
+            server.abort();
+            result
+        };
+
+        assert!(probe(WorkerHealthState::Serving).await.is_ok());
+        // Degraded is still serving: keep routing, do not fail the probe.
+        assert!(probe(WorkerHealthState::Degraded).await.is_ok());
+        // Draining is its own outcome so the readiness machine can demote at
+        // once -- not a status write from inside the probe, and not a plain
+        // failure that waits for the threshold.
+        assert!(matches!(
+            probe(WorkerHealthState::Draining).await,
+            Err(WorkerError::Draining { .. })
+        ));
+        for state in [WorkerHealthState::Starting, WorkerHealthState::NotServing] {
+            assert!(matches!(
+                probe(state).await,
+                Err(WorkerError::HealthCheckFailed { .. })
+            ));
+        }
+    }
+
     fn spawn_worker_control<S>(control: S) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
     where
         S: WorkerControlService,
@@ -2658,7 +2740,15 @@ mod tests {
         let mut left_rotation = false;
         for _ in 0..(health_config.failure_threshold as usize * 8) {
             let probe_ok = worker.check_health_async().await.is_ok();
-            if let Some(next) = compute_next_status(&worker, probe_ok, &health_config) {
+            if let Some(next) = compute_next_status(
+                &worker,
+                if probe_ok {
+                    ProbeOutcome::Healthy
+                } else {
+                    ProbeOutcome::Unhealthy
+                },
+                &health_config,
+            ) {
                 worker.set_status(next);
             }
             statuses.push(worker.status());
