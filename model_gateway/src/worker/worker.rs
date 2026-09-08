@@ -387,13 +387,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// [`Worker::load`] to the window: a read-then-send lets two dispatches
     /// both take the last free slot, which is exactly the over-window burst
     /// the gate exists to prevent.
-    fn try_admit_pd(&self, count: usize, window: usize) -> bool;
+    ///
+    /// The defaults admit unconditionally and track nothing. They exist for
+    /// implementations that carry no shared runtime (the language bindings,
+    /// test doubles): the gate only reaches a worker that reports a running
+    /// window, and any implementation that does report one must override
+    /// these three with a real claim, or the window is not enforced.
+    fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
+        true
+    }
 
     /// Release `count` rooms claimed by [`Worker::try_admit_pd`].
-    fn release_pd(&self, count: usize);
+    fn release_pd(&self, _count: usize) {}
 
     /// Rooms currently claimed on this worker.
-    fn pd_admitted(&self) -> usize;
+    fn pd_admitted(&self) -> usize {
+        0
+    }
 
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
