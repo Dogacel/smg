@@ -1892,10 +1892,12 @@ impl Worker for BasicWorker {
                     // stale probe after a same-URL replacement, and resets the
                     // failure counter so the liveness budget is not shortened.
                     WorkerHealthState::Draining => {
-                        tracing::warn!(
+                        // Observation only; the readiness machine logs the
+                        // transition it makes from it, once.
+                        tracing::debug!(
                             worker_url = %self.metadata.spec.url,
                             control_url,
-                            "SMG Worker is DRAINING"
+                            "SMG Worker reports DRAINING"
                         );
                         return Err(WorkerError::Draining {
                             url: self.metadata.spec.url.clone(),
@@ -2453,8 +2455,6 @@ mod tests {
         }
     }
 
-    /// Serve `control` on an ephemeral port until the returned handle is
-    /// aborted, and hand back the address to point a worker at.
     /// A Worker whose `GetHealth` answers a fixed state, for the probe's
     /// state mapping.
     struct FixedStateWorkerControl(WorkerHealthState);
@@ -2535,6 +2535,8 @@ mod tests {
         }
     }
 
+    /// Serve `control` on an ephemeral port until the returned handle is
+    /// aborted, and hand back the address to point a worker at.
     fn spawn_worker_control<S>(control: S) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
     where
         S: WorkerControlService,

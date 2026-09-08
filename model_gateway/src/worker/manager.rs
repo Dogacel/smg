@@ -519,9 +519,11 @@ async fn apply_probe_completion(
     let outcome = match probe_result {
         Ok(()) => ProbeOutcome::Healthy,
         Err(WorkerError::Draining { .. }) => {
-            warn!(
+            // Every probe while the worker drains lands here; the one that
+            // actually changes its status is logged with the transition.
+            debug!(
                 worker_url = %worker.url(),
-                "Worker is draining; leaving rotation"
+                "Worker reports draining"
             );
             ProbeOutcome::Draining
         }
@@ -569,6 +571,12 @@ async fn apply_probe_completion(
             ?new,
             "Worker status transition"
         );
+        if outcome == ProbeOutcome::Draining && new == WorkerStatus::NotReady {
+            warn!(
+                worker_url = %worker.url(),
+                "Worker is draining; left rotation"
+            );
+        }
         if new == WorkerStatus::Failed {
             if let Some(jq) = job_queue {
                 submit_removal_job(
@@ -723,6 +731,9 @@ pub(crate) enum ProbeOutcome {
 ///   - Ready → NotReady at once on a `Draining` outcome (the worker refuses
 ///     new work already); the failure counter is reset as on the threshold
 ///     path so the liveness budget is unchanged
+///   - Any other status holds on `Draining`: the worker is alive and
+///     answering, so a long drain spends no liveness budget and is re-admitted
+///     through the normal success threshold once it serves again
 pub(crate) fn compute_next_status(
     worker: &Arc<dyn Worker>,
     outcome: ProbeOutcome,
@@ -737,10 +748,15 @@ pub(crate) fn compute_next_status(
     // Pending cap: prevent misconfigured URLs from sitting in Pending forever.
     let max_pending_probes = failure_threshold * 10;
 
-    if outcome == ProbeOutcome::Draining && current_status == WorkerStatus::Ready {
+    if outcome == ProbeOutcome::Draining {
         worker.consecutive_successes_reset();
-        worker.consecutive_failures_reset();
-        return Some(WorkerStatus::NotReady);
+        if current_status == WorkerStatus::Ready {
+            worker.consecutive_failures_reset();
+            return Some(WorkerStatus::NotReady);
+        }
+        // Draining is not dying: neither the liveness budget nor the Pending
+        // cap moves while the worker keeps answering that it is draining.
+        return None;
     }
 
     if outcome == ProbeOutcome::Healthy {
@@ -1613,15 +1629,41 @@ mod tests {
     }
 
     #[test]
-    fn draining_while_not_ready_is_an_ordinary_failure() {
-        // Only a Ready worker has rotation to leave; elsewhere the outcome
-        // counts like any failed probe.
+    fn a_long_drain_holds_in_not_ready_and_readmits_when_serving_resumes() {
+        // Only a Ready worker has rotation to leave. Once out, a worker that
+        // keeps answering "draining" is alive, so the drain spends no liveness
+        // budget however long it runs -- well past 3 * failure_threshold --
+        // and it comes back through the ordinary success threshold.
         let worker = make_worker("http://w:1", 2, 3);
-        assert_eq!(worker.status(), WorkerStatus::Pending);
+        worker.set_status(WorkerStatus::NotReady);
+        for _ in 0..40 {
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+                None
+            );
+        }
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
         assert_eq!(
-            compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
             None
         );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            Some(WorkerStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn draining_while_pending_neither_promotes_nor_spends_the_pending_cap() {
+        let worker = make_worker("http://w:1", 2, 3);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        for _ in 0..40 {
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+                None
+            );
+        }
         assert_eq!(worker.status(), WorkerStatus::Pending);
     }
 
