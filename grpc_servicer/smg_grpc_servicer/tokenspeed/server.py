@@ -252,10 +252,16 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         """
         while not stop_event.is_set():
             await asyncio.sleep(_WORKER_CONTROL_WATCH_INTERVAL_SECS)
-            if not lifecycle.running:
+            # `running` covers the control plane's own listener. The engine
+            # link connects in the background after the listener is up, so its
+            # failure only ever lands in `last_error`; without checking it too,
+            # a wrong engine endpoint would leave this process serving
+            # NOT_SERVING forever with nothing logged.
+            error = lifecycle.last_error
+            if not lifecycle.running or error:
                 logger.error(
-                    "Worker control plane exited (%s) — shutting down the TokenSpeed gRPC server",
-                    lifecycle.last_error or "no error reported",
+                    "Worker control plane cannot serve (%s) — shutting down the TokenSpeed gRPC server",
+                    error or "control plane exited unexpectedly",
                 )
                 stop_event.set()
                 return

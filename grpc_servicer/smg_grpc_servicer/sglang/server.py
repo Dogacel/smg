@@ -395,13 +395,20 @@ async def serve_grpc(
                 logger.info("Request manager requested shutdown")
                 stop_event.set()
                 return
-            if worker_control is not None and not worker_control.running:
-                logger.error(
-                    "Worker control plane exited unexpectedly: %s",
-                    worker_control.last_error or "unknown error",
-                )
-                stop_event.set()
-                return
+            if worker_control is not None:
+                # `running` covers the control plane's own listener; the engine
+                # link connects in the background after the listener is up, so
+                # its failure only ever lands in `last_error`. Without checking
+                # it too, a wrong engine endpoint would leave this process
+                # serving NOT_SERVING forever with nothing logged.
+                error = worker_control.last_error
+                if not worker_control.running or error:
+                    logger.error(
+                        "Worker control plane cannot serve: %s",
+                        error or "control plane exited unexpectedly",
+                    )
+                    stop_event.set()
+                    return
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.25)
             except TimeoutError:
