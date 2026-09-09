@@ -654,6 +654,27 @@ impl Usage {
         }
         self
     }
+
+    /// Add speculative decoding details to this Usage.
+    ///
+    /// `accepted` excludes the bonus token sampled after each verify step and
+    /// `drafted` is the number proposed, so the rejected count is their
+    /// difference. Merges with any details already set by
+    /// [`Self::with_reasoning_tokens`] rather than replacing them.
+    pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
+        if drafted > 0 {
+            let reasoning_tokens = self
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens);
+            self.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens,
+                accepted_prediction_tokens: Some(accepted),
+                rejected_prediction_tokens: Some(drafted.saturating_sub(accepted)),
+            });
+        }
+        self
+    }
 }
 
 #[serde_with::skip_serializing_none]

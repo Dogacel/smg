@@ -2057,6 +2057,23 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Accepted speculative draft tokens, excluding the bonus token sampled
+    /// after each verify step. Only TokenSpeed reports this today.
+    pub fn spec_accepted_tokens(&self) -> u32 {
+        match self {
+            Self::TokenSpeed(c) => c.spec_accepted_tokens,
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => 0,
+        }
+    }
+
+    /// Speculative draft tokens proposed, i.e. verify steps times draft width.
+    pub fn spec_draft_tokens(&self) -> u32 {
+        match self {
+            Self::TokenSpeed(c) => c.spec_draft_tokens,
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => 0,
+        }
+    }
+
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
