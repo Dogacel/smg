@@ -1491,6 +1491,7 @@ mod request_release_tests {
                     output_logprobs: None,
                     matched_stop: None,
                     index: 0,
+                    ..Default::default()
                 })),
             }),
         ]

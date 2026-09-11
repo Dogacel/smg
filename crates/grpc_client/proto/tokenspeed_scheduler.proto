@@ -271,9 +271,6 @@ message GenerateComplete {
 
   uint32 index = 9;
 
-  // Speculative decoding, per request. accepted excludes the bonus token
-  // sampled after each verify step; drafted is verify steps * draft width.
-  // Both zero when speculative decoding is off.
   uint32 spec_accepted_tokens = 10;
   uint32 spec_draft_tokens = 11;
 }

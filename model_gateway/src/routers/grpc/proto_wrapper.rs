@@ -2057,20 +2057,25 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Accepted speculative draft tokens, excluding the bonus token sampled
-    /// after each verify step. Only TokenSpeed reports this today.
+    /// Get accepted speculative draft tokens.
     pub fn spec_accepted_tokens(&self) -> u32 {
         match self {
+            Self::Sglang(c) => c.spec_accepted_tokens,
+            Self::Vllm(c) => c.spec_accepted_tokens,
+            Self::Trtllm(c) => c.spec_accepted_tokens,
             Self::TokenSpeed(c) => c.spec_accepted_tokens,
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => 0,
+            Self::Mlx(_) => 0,
         }
     }
 
-    /// Speculative draft tokens proposed, i.e. verify steps times draft width.
+    /// Get proposed speculative draft tokens.
     pub fn spec_draft_tokens(&self) -> u32 {
         match self {
+            Self::Sglang(c) => c.spec_draft_tokens,
+            Self::Vllm(c) => c.spec_draft_tokens,
+            Self::Trtllm(c) => c.spec_draft_tokens,
             Self::TokenSpeed(c) => c.spec_draft_tokens,
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => 0,
+            Self::Mlx(_) => 0,
         }
     }
 
